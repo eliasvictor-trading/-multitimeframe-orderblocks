@@ -1,10 +1,6 @@
 # -multitimeframe-orderblocks
 A multi‑timeframe checklist dashboard + ORB (Opening Range Break) breakout zones + VWAP “warn-only” markers + a Latest Order Blocks panel.
 
-# multitimeframe-orderblocks (TradingView Pine v6) — v3.1.2
-
-A multi‑timeframe checklist dashboard + ORB (Opening Range Break) breakout zones + VWAP “warn-only” markers + a Latest Order Blocks panel.
-
 This repo is **connector‑agnostic**. Automated execution is configured in TradingView Alerts and your connector settings.
 
 ---
@@ -46,13 +42,6 @@ Configurable timeframe list (e.g., `1,5,15,30,60,240`) with per‑timeframe stat
 ### Latest Order Blocks Panel
 - Displays latest bullish/bearish OB High/Avg/Low
 - Panel position is independent from the dashboard
-
----
-
-## Files
-
-- `src/mtf-checklist-dashboard-v3.1.2.pine` — the indicator script
-
 ---
 
 ## Alerts (connector‑agnostic)
