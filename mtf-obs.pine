@@ -1,0 +1,634 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © EliasVictor
+
+//@version=6
+indicator("MTF Checklist Dashboard v3.1.2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+
+//==============================
+// Const-safe sizing
+//==============================
+MAX_TFS   = 12
+DASH_ROWS = MAX_TFS + 5     // header + MAX_TFS rows + 3 footer rows + 1 debug row
+OB_ROWS   = 9               // title + sep + 3 bull + sep + 3 bear
+
+//=============================================================================
+// Inputs - Time/Session (Timezone dropdown; const-safe defaults)
+//=============================================================================
+tzChoice = input.string(
+     "Symbol",
+     "Timezone",
+     options=["Symbol","America/Los_Angeles","America/Denver","America/Chicago","America/New_York","Etc/UTC","Europe/London","Europe/Berlin","Asia/Tokyo","Australia/Sydney"],
+     group="Time Settings",
+     tooltip="Timezone used to interpret RTH/Best-Hours session strings. 'Symbol' uses the exchange timezone (syminfo.timezone)."
+)
+tz = tzChoice == "Symbol" ? syminfo.timezone : tzChoice
+
+rthSession = input.session(
+     "0000-2359",
+     "RTH Session (used for ORB + Day Hi/Lo)",
+     group="Time Settings",
+     tooltip="Default is full day. For RTH-only behavior, set this to your RTH hours (in the selected timezone)."
+)
+
+useBestHours = input.bool(true, "Use Best-Hours Filter", group="Time Settings")
+bestSession1 = input.session("0000-2359", "Best Session 1", group="Time Settings")
+bestSession2 = input.session("0000-0000", "Best Session 2 (disable = 0000-0000)", group="Time Settings")
+
+//=============================================================================
+// Inputs - Basic Settings
+//=============================================================================
+timeframes    = input.string("1,5,15,30,60,240", "Dashboard/Signal Timeframes (comma-separated)", group="Basic Settings")
+showHdr       = input.bool(true, "Show Header", group="Basic Settings")
+orbMinutes    = input.int(15, "ORB Minutes", minval=1, group="Basic Settings")
+nearPct       = input.float(0.20, "Near % for daily highs/lows", step=0.05, group="Basic Settings")
+useCloseForPx = input.bool(true, "Use close for comparisons", group="Basic Settings")
+
+//=============================================================================
+// Inputs - Display Positions (separate controls)
+//=============================================================================
+dashPosStr = input.string(
+     "Top Right",
+     "Matrix Position",
+     options=["Top Left","Top Center","Top Right","Middle Left","Middle Center","Middle Right","Bottom Left","Bottom Center","Bottom Right"],
+     group="Display"
+)
+
+obPosStr = input.string(
+     "Bottom Right",
+     "Order Block Panel Position",
+     options=["Top Left","Top Center","Top Right","Middle Left","Middle Center","Middle Right","Bottom Left","Bottom Center","Bottom Right"],
+     group="Order Blocks"
+)
+
+//=============================================================================
+// Inputs - Confluence Filters
+//=============================================================================
+minConfluence = input.int(5, "Minimum Timeframes Aligned (3-6)", minval=3, maxval=6, group="Confluence Filters")
+requireHTF    = input.bool(true, "Require Higher Timeframe Confirmation", group="Confluence Filters")
+minHTF        = input.int(2, "Min Higher Timeframes Aligned", minval=1, maxval=12, group="Confluence Filters")
+htfTimeframes = input.string("15,30,60,240", "HTF Timeframes (comma-separated)", group="Confluence Filters")
+
+//=============================================================================
+// Inputs - ORB Filters
+//=============================================================================
+useOrbDist        = input.bool(true, "ORB Breakout Distance Required", group="ORB Filters")
+orbDistPct        = input.float(10.0, "Min Breakout % Beyond ORB", minval=0.0, maxval=100.0, step=0.5, group="ORB Filters", tooltip="Percent of ORB RANGE (H-L). Example: 10 = 10% of ORB range.")
+breakoutFreshMins = input.int(30, "Breakout Freshness Window (minutes)", minval=1, maxval=240, group="ORB Filters")
+
+//=============================================================================
+// Inputs - Breakout Zone (ORB-based; optional breakout gate)
+//=============================================================================
+useBreakoutZoneGate = input.bool(true, "Gate breakout entries by ORB breakout zone", group="Breakout Zone (ORB)")
+showBreakoutZones   = input.bool(true, "Show ORB breakout zones on chart", group="Breakout Zone (ORB)")
+boBufferPts         = input.float(1.0, "Breakout zone buffer (pts)", minval=0.0, step=0.25, group="Breakout Zone (ORB)")
+boMaxExtPts         = input.float(10.0, "Breakout zone max extension (pts)", minval=0.0, step=0.25, group="Breakout Zone (ORB)")
+
+//=============================================================================
+// Inputs - VWAP Warning (WARN ONLY; does NOT gate entries)
+//=============================================================================
+useVwapWarn         = input.bool(true, "Warn if extended from VWAP on entry", group="VWAP Warning")
+vwapWarnAppliesTo   = input.string("Breakouts only", "Warn applies to", options=["Breakouts only","All entries"], group="VWAP Warning")
+vwapWarnPts         = input.float(25.0, "VWAP extension threshold (pts)", minval=0.0, step=1.0, group="VWAP Warning")
+showVwapWarnMarkers = input.bool(true, "Show VWAP warning markers", group="VWAP Warning")
+
+//=============================================================================
+// Inputs - Candle Filter
+//=============================================================================
+useCandleFilter = input.bool(true, "Strong Directional Candle", group="Candle Filter")
+candleBodyPct   = input.float(60.0, "Min Candle Body %", minval=40.0, maxval=90.0, step=5.0, group="Candle Filter")
+
+//=============================================================================
+// Inputs - Range Filter (No symbol hardcoding)
+//=============================================================================
+useRangeFilter       = input.bool(true, "Block Entries Near RTH High/Low (Points)", group="Range Filter")
+rangeBlockPtsInput   = input.float(0.0, "Range Block (Points) [0 = AUTO]", minval=0.0, step=1.0, group="Range Filter")
+microPointValueMax   = input.float(5.0,  "AUTO: Micro if pointvalue <= ", minval=0.01, step=0.25, group="Range Filter")
+microRangeDefaultPts = input.float(20.0, "AUTO: Micro Default (pts)", minval=0.0, step=1.0, group="Range Filter")
+stdRangeDefaultPts   = input.float(35.0, "AUTO: Standard Default (pts)", minval=0.0, step=1.0, group="Range Filter")
+
+//=============================================================================
+// Inputs - Entry Logic
+//=============================================================================
+entryMode       = input.string("Both", "Entry Mode", options=["Breakout","Pullback","Both"], group="Entry Logic")
+usePullbackVWAP = input.bool(true, "Require VWAP Alignment on Pullbacks", group="Entry Logic")
+usePullback200  = input.bool(true, "Require 200 EMA Alignment on Pullbacks", group="Entry Logic")
+
+//=============================================================================
+// Visual Signals Options
+//=============================================================================
+showSignals = input.bool(true, "Show Entry Signals", group="Visual Signals")
+showArrows  = input.bool(true, "Show Arrows", group="Visual Signals")
+showBgColor = input.bool(true, "Background Color", group="Visual Signals")
+
+//=============================================================================
+// Inputs - Latest Order Block Panel (Latest Only)
+//=============================================================================
+obShowPanel    = input.bool(true, "Show Latest Order Blocks Panel", group="Order Blocks")
+obPeriods      = input.int(5, "OB Relevant Periods", minval=1, group="Order Blocks")
+obThresholdPct = input.float(0.0, "OB Min % Move", step=0.1, group="Order Blocks")
+obUseWicks     = input.bool(false, "OB Use Wicks for Zone", group="Order Blocks")
+
+//=============================================================================
+// Debug footer row
+//=============================================================================
+showDebugFooter = input.bool(true, "Show Debug Footer", group="Debug")
+debugShortCodes = input.bool(true, "Debug uses short codes", group="Debug", tooltip="Short: RTH,BH,ORB,DONE,RG,CND,CF,HTF,BRK,FR,ZN,VW!")
+
+//=============================================================================
+// Parse timeframes (dashboard/signal) and HTF list
+//=============================================================================
+var string[] tfs = array.new_string()
+if barstate.isfirst
+    for tf in str.split(timeframes, ",")
+        t = str.trim(tf)
+        if t != ""
+            array.push(tfs, t)
+
+var string[] htfs = array.new_string()
+if barstate.isfirst
+    for tf in str.split(htfTimeframes, ",")
+        t = str.trim(tf)
+        if t != ""
+            array.push(htfs, t)
+
+isInList(tfStr, arr) =>
+    found = false
+    sz = array.size(arr)
+    if sz > 0
+        for k = 0 to sz - 1
+            if tfStr == array.get(arr, k)
+                found := true
+    found
+
+//=============================================================================
+// Session State (RTH + Best Hours) - robust daily start even for 0000-2359
+//=============================================================================
+inRTH = not na(time(timeframe.period, rthSession, tz))
+
+newDayBase = ta.change(time("D", "0000-2359", tz)) != 0
+rthStart = inRTH and (not inRTH[1] or newDayBase)
+
+inBest1     = not na(time(timeframe.period, bestSession1, tz))
+inBest2     = bestSession2 == "0000-0000" ? false : not na(time(timeframe.period, bestSession2, tz))
+bestHoursOK = (not useBestHours) or inBest1 or inBest2
+tradeTimeOK = inRTH and bestHoursOK
+
+//=============================================================================
+// ORB (TF-accurate on orbMinutes TF via request.security)
+// Robust session-start detection so ORH/ORL work even for 24h sessions.
+//=============================================================================
+orbTF = str.tostring(orbMinutes)
+
+orbVals() =>
+    inSess = not na(time(timeframe.period, rthSession, tz))
+    newDay = ta.change(time("D", "0000-2359", tz)) != 0
+    sessStart = inSess and (not inSess[1] or newDay)
+    _orh = ta.valuewhen(sessStart, high, 0)
+    _orl = ta.valuewhen(sessStart, low, 0)
+    _end = ta.valuewhen(sessStart, time_close, 0)
+    [_orh, _orl, _end]
+
+[ORH, ORL, orbEndTime] = request.security(syminfo.tickerid, orbTF, orbVals(), lookahead=barmerge.lookahead_off)
+
+// Track base session start time so we never treat yesterday's ORB as "ready" today
+var int sessStartTime = na
+if rthStart
+    sessStartTime := time
+
+orbEndOk = (not na(sessStartTime)) and (not na(orbEndTime)) and (orbEndTime >= sessStartTime)
+orbDefined = orbEndOk and (not na(ORH)) and (not na(ORL))
+
+// Sticky ORB-ready flag: becomes true once the ORB bar is COMPLETE for the current session
+var bool orbReady = false
+if rthStart
+    orbReady := false
+if inRTH and (not orbReady) and orbEndOk and (time_close >= orbEndTime)
+    orbReady := true
+
+//=============================================================================
+// RTH Day High/Low (RTH-only accumulation on chart TF)
+//=============================================================================
+var float dayHigh  = na
+var float dayLow   = na
+var float pDayHigh = na
+var float pDayLow  = na
+
+if rthStart
+    pDayHigh := dayHigh
+    pDayLow  := dayLow
+    dayHigh  := high
+    dayLow   := low
+else if inRTH
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow  := na(dayLow) ? low  : math.min(dayLow, low)
+
+//=============================================================================
+// Candle Filter (base timeframe)
+//=============================================================================
+candleRange = high - low
+candleBody  = math.abs(close - open)
+bodyPercent = candleRange > 0.0 ? (candleBody / candleRange) * 100.0 : 0.0
+strongBullCandle = (close > open) and (bodyPercent >= candleBodyPct)
+strongBearCandle = (close < open) and (bodyPercent >= candleBodyPct)
+candleOK_Long  = (not useCandleFilter) or strongBullCandle
+candleOK_Short = (not useCandleFilter) or strongBearCandle
+
+//=============================================================================
+// Base Timeframe Trend Measures (for pullback logic) + price basis
+//=============================================================================
+e9_base   = ta.ema(close, 9)
+e21_base  = ta.ema(close, 21)
+e200_base = ta.ema(close, 200)
+vwap_base = ta.vwap
+priceBasis = useCloseForPx ? close : hl2
+
+//=============================================================================
+// Range Block (AUTO based on syminfo.pointvalue)
+//=============================================================================
+isMicro       = syminfo.pointvalue <= microPointValueMax
+autoRangePts  = isMicro ? microRangeDefaultPts : stdRangeDefaultPts
+rangeBlockPts = rangeBlockPtsInput == 0.0 ? autoRangePts : rangeBlockPtsInput
+
+blockLong  = useRangeFilter and inRTH and not na(dayHigh) and ((dayHigh - priceBasis) <= rangeBlockPts)
+blockShort = useRangeFilter and inRTH and not na(dayLow)  and ((priceBasis - dayLow)  <= rangeBlockPts)
+rangeOK_Long  = not blockLong
+rangeOK_Short = not blockShort
+
+//=============================================================================
+// ORB Break Status + Breakout Freshness Window (gated until ORB is READY)
+//=============================================================================
+var bool orbBrokeUp = false
+var bool orbBrokeDown = false
+var int  orbBreakUpTime = na
+var int  orbBreakDownTime = na
+
+if rthStart
+    orbBrokeUp := false
+    orbBrokeDown := false
+    orbBreakUpTime := na
+    orbBreakDownTime := na
+
+if inRTH and orbDefined and orbReady
+    if not orbBrokeUp and (priceBasis > ORH)
+        orbBrokeUp := true
+        orbBreakUpTime := time
+    if not orbBrokeDown and (priceBasis < ORL)
+        orbBrokeDown := true
+        orbBreakDownTime := time
+
+freshMs = breakoutFreshMins * 60000
+breakoutFreshLong  = orbBrokeUp and not na(orbBreakUpTime) and ((time - orbBreakUpTime) <= freshMs)
+breakoutFreshShort = orbBrokeDown and not na(orbBreakDownTime) and ((time - orbBreakDownTime) <= freshMs)
+
+//=============================================================================
+// ORB Breakout Distance Confirmation (gated until ORB READY)
+//=============================================================================
+orbRange = orbDefined ? math.abs(ORH - ORL) : na
+orbBreakoutDist = (orbDefined and not na(orbRange)) ? (orbRange * (orbDistPct / 100.0)) : na
+
+longOrbConfirmed  = orbDefined and orbReady and (useOrbDist ? (priceBasis > (ORH + orbBreakoutDist)) : (priceBasis > ORH))
+shortOrbConfirmed = orbDefined and orbReady and (useOrbDist ? (priceBasis < (ORL - orbBreakoutDist)) : (priceBasis < ORL))
+
+//=============================================================================
+// ORB Breakout Zones (defined only after ORB READY)
+// FIXED: zone high/low is ORH+maxExt and ORH+buffer (not buffer+maxExt)
+//=============================================================================
+boMax = math.max(boMaxExtPts, boBufferPts)
+
+boLongLow   = (orbDefined and orbReady) ? (ORH + boBufferPts) : na
+boLongHigh  = (orbDefined and orbReady) ? (ORH + boMax)       : na
+boShortHigh = (orbDefined and orbReady) ? (ORL - boBufferPts) : na
+boShortLow  = (orbDefined and orbReady) ? (ORL - boMax)       : na
+
+boInZone_Long  = not na(boLongLow)  and (priceBasis >= boLongLow)  and (priceBasis <= boLongHigh)
+boInZone_Short = not na(boShortLow) and (priceBasis <= boShortHigh) and (priceBasis >= boShortLow)
+
+//=============================================================================
+// Dashboard helpers
+//=============================================================================
+nearCheck(price, hi, lo, pct) =>
+    condHi = (not na(hi)) and (math.abs(price - hi) <= price * (pct / 100.0))
+    condLo = (not na(lo)) and (math.abs(price - lo) <= price * (pct / 100.0))
+    condHi ? "Hi" : condLo ? "Lo" : "Mid"
+
+//=============================================================================
+// Table positions
+//=============================================================================
+dashPos = dashPosStr == "Top Left" ? position.top_left : dashPosStr == "Top Center" ? position.top_center : dashPosStr == "Top Right" ? position.top_right : dashPosStr == "Middle Left" ? position.middle_left : dashPosStr == "Middle Center" ? position.middle_center : dashPosStr == "Middle Right" ? position.middle_right : dashPosStr == "Bottom Left" ? position.bottom_left : dashPosStr == "Bottom Center" ? position.bottom_center : position.bottom_right
+obPos   = obPosStr == "Top Left" ? position.top_left : obPosStr == "Top Center" ? position.top_center : obPosStr == "Top Right" ? position.top_right : obPosStr == "Middle Left" ? position.middle_left : obPosStr == "Middle Center" ? position.middle_center : obPosStr == "Middle Right" ? position.middle_right : obPosStr == "Bottom Left" ? position.bottom_left : obPosStr == "Bottom Center" ? position.bottom_center : position.bottom_right
+
+//=============================================================================
+// Table Setup
+//=============================================================================
+var table dash  = table.new(dashPos, 10, DASH_ROWS, border_width=1)
+var table obTbl = table.new(obPos, 1, OB_ROWS, border_width=1)
+
+colBull = color.new(color.lime, 0)
+colBear = color.new(color.red, 0)
+colNeu  = color.new(color.yellow, 0)
+colText = color.new(color.white, 0)
+colHdr  = color.new(color.silver, 0)
+colBack = color.new(color.black, 0)
+
+if barstate.islast and showHdr
+    table.cell(dash, 0, 0, "TF", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 1, 0, "C", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 2, 0, "P", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 3, 0, "ORB", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 4, 0, "VWAP", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 5, 0, "E200", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 6, 0, "D Hi/Lo", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 7, 0, "PD Hi/Lo", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 8, 0, "9 vs 21", bgcolor=colHdr, text_color=color.black)
+    table.cell(dash, 9, 0, "9&21 v200", bgcolor=colHdr, text_color=color.black)
+
+//=============================================================================
+// MTF loop: dashboard rendering + confluence scoring
+//=============================================================================
+int longScore = 0
+int shortScore = 0
+int htfScoreLong = 0
+int htfScoreShort = 0
+
+tfCountRaw = array.size(tfs)
+tfCount = tfCountRaw > MAX_TFS ? MAX_TFS : tfCountRaw
+
+if tfCount > 0
+    for i = 0 to tfCount - 1
+        tf = array.get(tfs, i)
+
+        [cTF, oTF, pcTF, poTF, vwapTF, midTF, e9, e21, e200] =
+             request.security(
+                 syminfo.tickerid,
+                 tf,
+                 [close, open, close[1], open[1], ta.vwap, hl2, ta.ema(close, 9), ta.ema(close, 21), ta.ema(close, 200)],
+                 lookahead=barmerge.lookahead_off
+             )
+
+        currBull = cTF >= oTF
+        prevBull = pcTF >= poTF
+        priceNowTF = useCloseForPx ? cTF : midTF
+
+        orbPosTxt = (orbDefined and priceNowTF > ORH) ? "A" : (orbDefined and priceNowTF < ORL) ? "B" : "W"
+        vwapPos   = priceNowTF >= vwapTF ? "A" : "B"
+        e200Pos   = priceNowTF >= e200 ? "A" : "B"
+        nearToday = nearCheck(priceNowTF, dayHigh, dayLow, nearPct)
+        nearPrev  = nearCheck(priceNowTF, pDayHigh, pDayLow, nearPct)
+        nineVs21  = e9 >= e21 ? "A" : "B"
+        pairVs200 = (e9 >= e200 and e21 >= e200) ? ">>" : (e9 < e200 and e21 < e200) ? "<<" : "<>"
+
+        isBullishTF = currBull and (priceNowTF >= vwapTF) and (priceNowTF >= e200) and (e9 >= e21) and (e9 >= e200 and e21 >= e200)
+        isBearishTF = (not currBull) and (priceNowTF < vwapTF) and (priceNowTF < e200) and (e9 < e21) and (e9 < e200 and e21 < e200)
+
+        if isBullishTF
+            longScore += 1
+        if isBearishTF
+            shortScore += 1
+
+        if isInList(tf, htfs)
+            if isBullishTF
+                htfScoreLong += 1
+            if isBearishTF
+                htfScoreShort += 1
+
+        if barstate.islast
+            row = i + 1
+
+            clrC   = currBull ? colBull : colBear
+            clrP   = prevBull ? colBull : colBear
+            clrORB = orbPosTxt == "A" ? colBull : orbPosTxt == "B" ? colBear : colNeu
+            clrVW  = vwapPos == "A" ? colBull : colBear
+            clrE2  = e200Pos == "A" ? colBull : colBear
+            clrD   = nearToday == "Hi" ? colBull : nearToday == "Lo" ? colBear : colNeu
+            clrPD  = nearPrev == "Hi" ? colBull : nearPrev == "Lo" ? colBear : colNeu
+            clr921 = nineVs21 == "A" ? colBull : colBear
+            clrAll = pairVs200 == ">>" ? colBull : pairVs200 == "<<" ? colBear : colNeu
+
+            table.cell(dash, 0, row, tf, bgcolor=colBack, text_color=colText)
+            table.cell(dash, 1, row, currBull ? "G" : "R", bgcolor=clrC, text_color=colText)
+            table.cell(dash, 2, row, prevBull ? "G" : "R", bgcolor=clrP, text_color=colText)
+            table.cell(dash, 3, row, orbPosTxt, bgcolor=clrORB, text_color=colText)
+            table.cell(dash, 4, row, vwapPos, bgcolor=clrVW, text_color=colText)
+            table.cell(dash, 5, row, e200Pos, bgcolor=clrE2, text_color=colText)
+            table.cell(dash, 6, row, nearToday, bgcolor=clrD, text_color=colText)
+            table.cell(dash, 7, row, nearPrev, bgcolor=clrPD, text_color=colText)
+            table.cell(dash, 8, row, nineVs21, bgcolor=clr921, text_color=colText)
+            table.cell(dash, 9, row, pairVs200, bgcolor=clrAll, text_color=colText)
+
+//=============================================================================
+// Footer rows
+//=============================================================================
+orbRangeRow = tfCount + 1
+cdRow      = tfCount + 2
+pdRow      = tfCount + 3
+debugRow   = tfCount + 4
+
+if barstate.islast
+    table.cell(dash, 0, orbRangeRow, "ORB Range (" + str.tostring(orbMinutes) + "m)", bgcolor=color.new(color.blue, 70), text_color=colText)
+    table.merge_cells(dash, 0, orbRangeRow, 4, orbRangeRow)
+    table.cell(dash, 5, orbRangeRow, "H: " + str.tostring(ORH, format.mintick) + " | L: " + str.tostring(ORL, format.mintick) + " | R: " + str.tostring(orbRange, format.mintick), bgcolor=color.new(color.blue, 70), text_color=colText)
+    table.merge_cells(dash, 5, orbRangeRow, 9, orbRangeRow)
+
+    table.cell(dash, 0, cdRow, "Current Session", bgcolor=color.new(color.orange, 70), text_color=colText)
+    table.merge_cells(dash, 0, cdRow, 4, cdRow)
+    table.cell(dash, 5, cdRow, "High: " + str.tostring(dayHigh, format.mintick) + " | Low: " + str.tostring(dayLow, format.mintick), bgcolor=color.new(color.orange, 70), text_color=colText)
+    table.merge_cells(dash, 5, cdRow, 9, cdRow)
+
+    table.cell(dash, 0, pdRow, "Previous Session", bgcolor=color.new(color.purple, 70), text_color=colText)
+    table.merge_cells(dash, 0, pdRow, 4, pdRow)
+    table.cell(dash, 5, pdRow, "High: " + str.tostring(pDayHigh, format.mintick) + " | Low: " + str.tostring(pDayLow, format.mintick), bgcolor=color.new(color.purple, 70), text_color=colText)
+    table.merge_cells(dash, 5, pdRow, 9, pdRow)
+
+//=============================================================================
+// Confluence gates
+//=============================================================================
+confluenceOK_Long  = longScore >= minConfluence
+confluenceOK_Short = shortScore >= minConfluence
+htfOK_Long  = (not requireHTF) or (htfScoreLong >= minHTF)
+htfOK_Short = (not requireHTF) or (htfScoreShort >= minHTF)
+
+//=============================================================================
+// Entry Logic (Breakout vs Pullback)
+//=============================================================================
+useBreakoutEntry = (entryMode == "Breakout") or (entryMode == "Both")
+usePullbackEntry = (entryMode == "Pullback") or (entryMode == "Both")
+
+pullbackLongZone = (low <= e21_base) and (close >= e9_base)
+pullbackLongLoc  = ((not usePullbackVWAP) or (close >= vwap_base)) and ((not usePullback200) or (close >= e200_base))
+pullbackShortZone = (high >= e21_base) and (close <= e9_base)
+pullbackShortLoc  = ((not usePullbackVWAP) or (close <= vwap_base)) and ((not usePullback200) or (close <= e200_base))
+
+pullbackLongEntry  = tradeTimeOK and confluenceOK_Long and htfOK_Long and orbBrokeUp and pullbackLongZone and pullbackLongLoc and candleOK_Long and rangeOK_Long
+pullbackShortEntry = tradeTimeOK and confluenceOK_Short and htfOK_Short and orbBrokeDown and pullbackShortZone and pullbackShortLoc and candleOK_Short and rangeOK_Short
+
+breakoutLongBase  = tradeTimeOK and confluenceOK_Long and htfOK_Long and longOrbConfirmed and breakoutFreshLong and candleOK_Long and rangeOK_Long
+breakoutShortBase = tradeTimeOK and confluenceOK_Short and htfOK_Short and shortOrbConfirmed and breakoutFreshShort and candleOK_Short and rangeOK_Short
+
+breakoutLongEntry  = breakoutLongBase and ((not useBreakoutZoneGate) or boInZone_Long)
+breakoutShortEntry = breakoutShortBase and ((not useBreakoutZoneGate) or boInZone_Short)
+
+finalBreakoutLong  = useBreakoutEntry and breakoutLongEntry
+finalBreakoutShort = useBreakoutEntry and breakoutShortEntry
+finalPullbackLong  = usePullbackEntry and pullbackLongEntry
+finalPullbackShort = usePullbackEntry and pullbackShortEntry
+
+longEntry  = finalBreakoutLong or finalPullbackLong
+shortEntry = finalBreakoutShort or finalPullbackShort
+
+longExit  = shortScore >= 3
+shortExit = longScore >= 3
+
+//=============================================================================
+// VWAP Warn Only (does NOT gate entries)
+//=============================================================================
+vwapDistLong  = priceBasis - vwap_base
+vwapDistShort = vwap_base - priceBasis
+vwapExtLong   = vwapDistLong > vwapWarnPts
+vwapExtShort  = vwapDistShort > vwapWarnPts
+
+warnLong  = useVwapWarn and (vwapWarnAppliesTo == "All entries" ? longEntry : finalBreakoutLong) and vwapExtLong
+warnShort = useVwapWarn and (vwapWarnAppliesTo == "All entries" ? shortEntry : finalBreakoutShort) and vwapExtShort
+
+//=============================================================================
+// Debug footer helpers
+//=============================================================================
+fmtDebugStatus(nameShort, nameLong, ok) =>
+    label = debugShortCodes ? nameShort : nameLong
+    label + ":" + (ok ? "OK" : "X")
+
+buildDebugLine(isLong) =>
+    arr = array.new_string()
+    rangeOK_side = isLong ? rangeOK_Long : rangeOK_Short
+    candleOK_side = isLong ? candleOK_Long : candleOK_Short
+    confluenceOK_side = isLong ? confluenceOK_Long : confluenceOK_Short
+    htfOK_side = isLong ? htfOK_Long : htfOK_Short
+    orbConfirmed_side = isLong ? longOrbConfirmed : shortOrbConfirmed
+    breakoutFresh_side = isLong ? breakoutFreshLong : breakoutFreshShort
+    zoneOK_side = (not useBreakoutZoneGate) or (isLong ? boInZone_Long : boInZone_Short)
+    vwapClear = not (isLong ? warnLong : warnShort)
+
+    array.push(arr, fmtDebugStatus("RTH", "RTH", inRTH))
+    array.push(arr, fmtDebugStatus("BH", "Best Hours", bestHoursOK))
+    array.push(arr, fmtDebugStatus("ORB", "ORB Set", orbDefined))
+    array.push(arr, fmtDebugStatus("DONE", "ORB Ready", orbReady))
+    array.push(arr, fmtDebugStatus("RG", "Range", rangeOK_side))
+    array.push(arr, fmtDebugStatus("CND", "Candle", candleOK_side))
+    array.push(arr, fmtDebugStatus("CF", "Confluence", confluenceOK_side))
+    array.push(arr, fmtDebugStatus("HTF", "HTF", htfOK_side))
+    array.push(arr, fmtDebugStatus("BRK", "ORB Brk", orbConfirmed_side))
+    array.push(arr, fmtDebugStatus("FR", "Fresh", breakoutFresh_side))
+    array.push(arr, fmtDebugStatus("ZN", "Zone", zoneOK_side))
+    array.push(arr, fmtDebugStatus("VW!", "VWAP OK", vwapClear))
+
+    prefix = debugShortCodes ? (isLong ? "L" : "S") : (isLong ? "Long" : "Short")
+    joined = ""
+    arrSize = array.size(arr)
+    if arrSize > 0
+        for i = 0 to arrSize - 1
+            sep = i == 0 ? "" : " | "
+            joined += sep + array.get(arr, i)
+    prefix + " | " + joined
+
+if barstate.islast and showDebugFooter
+    table.cell(dash, 0, debugRow, debugShortCodes ? "DBG" : "Debug", bgcolor=color.new(color.gray, 80), text_color=colText)
+    table.cell(dash, 1, debugRow, buildDebugLine(true), bgcolor=color.new(color.gray, 92), text_color=colText)
+    table.merge_cells(dash, 1, debugRow, 4, debugRow)
+    table.cell(dash, 5, debugRow, buildDebugLine(false), bgcolor=color.new(color.gray, 92), text_color=colText)
+    table.merge_cells(dash, 5, debugRow, 9, debugRow)
+
+//=============================================================================
+// Breakout Zones Plot (kept) - includes BO_HIGH / BO_LOW
+//=============================================================================
+pBoLongLow  = plot(showBreakoutZones ? boLongLow : na,  title="BO_LONG_ZONE_LOW",  style=plot.style_linebr, linewidth=1, color=color.new(color.lime, 0))
+pBoLongHigh = plot(showBreakoutZones ? boLongHigh : na, title="BO_LONG_ZONE_HIGH", style=plot.style_linebr, linewidth=1, color=color.new(color.lime, 0))
+fill(pBoLongLow, pBoLongHigh, color=color.new(color.lime, 90), title="BO Long Zone Fill")
+
+pBoShortLow  = plot(showBreakoutZones ? boShortLow : na,  title="BO_SHORT_ZONE_LOW",  style=plot.style_linebr, linewidth=1, color=color.new(color.red, 0))
+pBoShortHigh = plot(showBreakoutZones ? boShortHigh : na, title="BO_SHORT_ZONE_HIGH", style=plot.style_linebr, linewidth=1, color=color.new(color.red, 0))
+fill(pBoShortLow, pBoShortHigh, color=color.new(color.red, 90), title="BO Short Zone Fill")
+
+// Compatibility pair: BO_HIGH / BO_LOW
+// - Uses LONG zone by default; switches to SHORT zone when price is below ORL.
+// - Only shows once ORB is ready.
+boHighSeries = (orbDefined and orbReady) ? (priceBasis < ORL ? boShortHigh : boLongHigh) : na
+boLowSeries  = (orbDefined and orbReady) ? (priceBasis < ORL ? boShortLow  : boLongLow)  : na
+
+plot(showBreakoutZones ? boHighSeries : na, title="BO_HIGH", style=plot.style_linebr, linewidth=2, color=color.new(color.white, 0))
+plot(showBreakoutZones ? boLowSeries  : na, title="BO_LOW",  style=plot.style_linebr, linewidth=2, color=color.new(color.white, 0))
+
+//=============================================================================
+// Visual Signals
+//=============================================================================
+plotshape(showSignals and showArrows and longEntry,  title="Long Arrow",  location=location.belowbar, color=color.new(color.green, 0), style=shape.triangleup,   size=size.small)
+plotshape(showSignals and showArrows and shortEntry, title="Short Arrow", location=location.abovebar, color=color.new(color.red,   0), style=shape.triangledown, size=size.small)
+
+plotshape(showSignals and showVwapWarnMarkers and warnLong,  title="VWAP Warn Long",  location=location.belowbar, style=shape.labelup,   text="VW!", color=color.new(color.orange, 0), textcolor=color.black, size=size.tiny)
+plotshape(showSignals and showVwapWarnMarkers and warnShort, title="VWAP Warn Short", location=location.abovebar, style=shape.labeldown, text="VW!", color=color.new(color.orange, 0), textcolor=color.black, size=size.tiny)
+
+bgcolor(showSignals and showBgColor and longEntry ? color.new(color.green, 92) : showSignals and showBgColor and shortEntry ? color.new(color.red, 92) : na)
+
+//=============================================================================
+// Latest Order Blocks (calculation) + Panel as a separate table (movable)
+//=============================================================================
+obPeriod  = obPeriods + 1
+obAbsMove = ((math.abs(close[obPeriod] - close[1])) / close[obPeriod]) * 100.0
+obRelMove = obAbsMove >= obThresholdPct
+
+obBullishCandle = close[obPeriod] < open[obPeriod]
+int obUp = 0
+for j = 1 to obPeriods
+    obUp += (close[j] > open[j] ? 1 : 0)
+
+obBull     = obBullishCandle and (obUp == obPeriods) and obRelMove
+obBullHigh = obBull ? (obUseWicks ? high[obPeriod] : open[obPeriod]) : na
+obBullLow  = obBull ? low[obPeriod] : na
+obBullAvg  = (obBullHigh + obBullLow) / 2.0
+
+obBearishCandle = close[obPeriod] > open[obPeriod]
+int obDn = 0
+for j = 1 to obPeriods
+    obDn += (close[j] < open[j] ? 1 : 0)
+
+obBear     = obBearishCandle and (obDn == obPeriods) and obRelMove
+obBearHigh = obBear ? high[obPeriod] : na
+obBearLow  = obBear ? (obUseWicks ? low[obPeriod] : open[obPeriod]) : na
+obBearAvg  = (obBearHigh + obBearLow) / 2.0
+
+var float latestBullHigh = na
+var float latestBullAvg  = na
+var float latestBullLow  = na
+var float latestBearHigh = na
+var float latestBearAvg  = na
+var float latestBearLow  = na
+
+if inRTH and obBull
+    latestBullHigh := obBullHigh
+    latestBullAvg  := obBullAvg
+    latestBullLow  := obBullLow
+
+if inRTH and obBear
+    latestBearHigh := obBearHigh
+    latestBearAvg  := obBearAvg
+    latestBearLow  := obBearLow
+
+if barstate.islast
+    table.clear(obTbl, 0, 0, 0, OB_ROWS - 1)
+    if obShowPanel
+        table.cell(obTbl, 0, 0, "")
+        table.cell(obTbl, 0, 0, "LATEST ORDER BLOCKS", bgcolor=color.new(color.gray, 70), text_color=color.white)
+        table.cell(obTbl, 0, 1, "-------------------------", bgcolor=color.new(color.black, 0), text_color=color.new(color.white, 60))
+        table.cell(obTbl, 0, 2, "Bull High: " + (na(latestBullHigh) ? "na" : str.tostring(latestBullHigh, "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
+        table.cell(obTbl, 0, 3, "Bull Avg : " + (na(latestBullAvg)  ? "na" : str.tostring(latestBullAvg,  "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
+        table.cell(obTbl, 0, 4, "Bull Low : " + (na(latestBullLow)  ? "na" : str.tostring(latestBullLow,  "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
+        table.cell(obTbl, 0, 5, "-------------------------", bgcolor=color.new(color.black, 0), text_color=color.new(color.white, 60))
+        table.cell(obTbl, 0, 6, "Bear High: " + (na(latestBearHigh) ? "na" : str.tostring(latestBearHigh, "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
+        table.cell(obTbl, 0, 7, "Bear Avg : " + (na(latestBearAvg)  ? "na" : str.tostring(latestBearAvg,  "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
+        table.cell(obTbl, 0, 8, "Bear Low : " + (na(latestBearLow)  ? "na" : str.tostring(latestBearLow,  "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
+
+//=============================================================================
+// Alerts (connector-agnostic; paste JSON in TradingView alert UI)
+//=============================================================================
+alertcondition(longEntry,  title="Long Entry Signal",  message="LONG_ENTRY")
+alertcondition(shortEntry, title="Short Entry Signal", message="SHORT_ENTRY")
+alertcondition(longExit,   title="Long Exit Signal",   message="LONG_EXIT")
+alertcondition(shortExit,  title="Short Exit Signal",  message="SHORT_EXIT")
