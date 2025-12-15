@@ -2,7 +2,7 @@
 // © EliasVictor
 
 //@version=6
-indicator("MTF Checklist Dashboard v3.1.2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+indicator("MTF Checklist Dashboard v3.1.3", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
 
 //==============================
 // Const-safe sizing
@@ -82,6 +82,9 @@ useBreakoutZoneGate = input.bool(true, "Gate breakout entries by ORB breakout zo
 showBreakoutZones   = input.bool(true, "Show ORB breakout zones on chart", group="Breakout Zone (ORB)")
 boBufferPts         = input.float(1.0, "Breakout zone buffer (pts)", minval=0.0, step=0.25, group="Breakout Zone (ORB)")
 boMaxExtPts         = input.float(10.0, "Breakout zone max extension (pts)", minval=0.0, step=0.25, group="Breakout Zone (ORB)")
+
+// NEW (v3.1.3): Compatibility plots toggle (default OFF)
+showBoCompatPlots   = input.bool(false, "Show BO_HIGH / BO_LOW (compatibility plots)", group="Breakout Zone (ORB)", tooltip="Default OFF to keep colored zones readable. Values remain computed for alerts/automation.")
 
 //=============================================================================
 // Inputs - VWAP Warning (WARN ONLY; does NOT gate entries)
@@ -164,7 +167,6 @@ isInList(tfStr, arr) =>
 // Session State (RTH + Best Hours) - robust daily start even for 0000-2359
 //=============================================================================
 inRTH = not na(time(timeframe.period, rthSession, tz))
-
 newDayBase = ta.change(time("D", "0000-2359", tz)) != 0
 rthStart = inRTH and (not inRTH[1] or newDayBase)
 
@@ -291,7 +293,6 @@ shortOrbConfirmed = orbDefined and orbReady and (useOrbDist ? (priceBasis < (ORL
 
 //=============================================================================
 // ORB Breakout Zones (defined only after ORB READY)
-// FIXED: zone high/low is ORH+maxExt and ORH+buffer (not buffer+maxExt)
 //=============================================================================
 boMax = math.max(boMaxExtPts, boBufferPts)
 
@@ -537,7 +538,7 @@ if barstate.islast and showDebugFooter
     table.merge_cells(dash, 5, debugRow, 9, debugRow)
 
 //=============================================================================
-// Breakout Zones Plot (kept) - includes BO_HIGH / BO_LOW
+// Breakout Zones Plot (colored zones) + Compatibility BO_HIGH / BO_LOW (toggle)
 //=============================================================================
 pBoLongLow  = plot(showBreakoutZones ? boLongLow : na,  title="BO_LONG_ZONE_LOW",  style=plot.style_linebr, linewidth=1, color=color.new(color.lime, 0))
 pBoLongHigh = plot(showBreakoutZones ? boLongHigh : na, title="BO_LONG_ZONE_HIGH", style=plot.style_linebr, linewidth=1, color=color.new(color.lime, 0))
@@ -547,14 +548,31 @@ pBoShortLow  = plot(showBreakoutZones ? boShortLow : na,  title="BO_SHORT_ZONE_L
 pBoShortHigh = plot(showBreakoutZones ? boShortHigh : na, title="BO_SHORT_ZONE_HIGH", style=plot.style_linebr, linewidth=1, color=color.new(color.red, 0))
 fill(pBoShortLow, pBoShortHigh, color=color.new(color.red, 90), title="BO Short Zone Fill")
 
-// Compatibility pair: BO_HIGH / BO_LOW
-// - Uses LONG zone by default; switches to SHORT zone when price is below ORL.
-// - Only shows once ORB is ready.
-boHighSeries = (orbDefined and orbReady) ? (priceBasis < ORL ? boShortHigh : boLongHigh) : na
-boLowSeries  = (orbDefined and orbReady) ? (priceBasis < ORL ? boShortLow  : boLongLow)  : na
+// --- BO_HIGH / BO_LOW compatibility series selection ---
+// Recommended behavior:
+// - Only provide a single pair (High/Low) that follows the active breakout context.
+// - If price is currently outside ORB, use that side.
+// - Otherwise, use the last breakout direction for the session.
+// - If no breakout context exists yet, these are na.
+var int lastBoDir = 0
+if rthStart
+    lastBoDir := 0
+if orbBrokeUp and (orbBreakUpTime == time)
+    lastBoDir := 1
+if orbBrokeDown and (orbBreakDownTime == time)
+    lastBoDir := -1
 
-plot(showBreakoutZones ? boHighSeries : na, title="BO_HIGH", style=plot.style_linebr, linewidth=2, color=color.new(color.white, 0))
-plot(showBreakoutZones ? boLowSeries  : na, title="BO_LOW",  style=plot.style_linebr, linewidth=2, color=color.new(color.white, 0))
+int dirNow = 0
+if orbDefined and orbReady
+    dirNow := priceBasis > ORH ? 1 : priceBasis < ORL ? -1 : lastBoDir
+
+boHighSeries = dirNow == 1 ? boLongHigh : dirNow == -1 ? boShortHigh : na
+boLowSeries  = dirNow == 1 ? boLongLow  : dirNow == -1 ? boShortLow  : na
+
+// Hide on chart by default (fully transparent), but keep values computed for alerts/automation.
+boCompatColor = showBoCompatPlots ? color.new(color.white, 70) : color.new(color.white, 100)
+plot(boHighSeries, title="BO_HIGH", style=plot.style_linebr, linewidth=1, color=boCompatColor)
+plot(boLowSeries,  title="BO_LOW",  style=plot.style_linebr, linewidth=1, color=boCompatColor)
 
 //=============================================================================
 // Visual Signals
@@ -614,7 +632,6 @@ if inRTH and obBear
 if barstate.islast
     table.clear(obTbl, 0, 0, 0, OB_ROWS - 1)
     if obShowPanel
-        table.cell(obTbl, 0, 0, "")
         table.cell(obTbl, 0, 0, "LATEST ORDER BLOCKS", bgcolor=color.new(color.gray, 70), text_color=color.white)
         table.cell(obTbl, 0, 1, "-------------------------", bgcolor=color.new(color.black, 0), text_color=color.new(color.white, 60))
         table.cell(obTbl, 0, 2, "Bull High: " + (na(latestBullHigh) ? "na" : str.tostring(latestBullHigh, "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
@@ -626,7 +643,7 @@ if barstate.islast
         table.cell(obTbl, 0, 8, "Bear Low : " + (na(latestBearLow)  ? "na" : str.tostring(latestBearLow,  "#.##")), bgcolor=color.new(color.black, 0), text_color=color.white)
 
 //=============================================================================
-// Alerts (connector-agnostic; paste JSON in TradingView alert UI)
+// Alerts (connector-agnostic; paste PickMyTrade JSON in TradingView alert UI)
 //=============================================================================
 alertcondition(longEntry,  title="Long Entry Signal",  message="LONG_ENTRY")
 alertcondition(shortEntry, title="Short Entry Signal", message="SHORT_ENTRY")
